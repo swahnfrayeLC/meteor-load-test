@@ -1,3 +1,4 @@
+
 (ns meteor-load-test.core
   (:require [clojure.data.json :as json]
             [clojure.string :as str])
@@ -6,6 +7,7 @@
   (:use [meteor-load-test util method_calls subscriptions initial_payload])
   )
 
+(declare test-runner-custom)
 (declare test-runner-factory)
 (def ddp-connected
   com.keysolutions.ddpclient.DDPClient$CONNSTATE/Connected)
@@ -51,56 +53,86 @@
             client-id (get-client-id)
            ]
 
-        (when debug?
-          (log "client id: " client-id))
-
-        ;; download initial html payload and all referenced files
-        (when download-payload?
-          (fetch-static-assets get-html target-url-str))
-
-        ;(if debug? (.addObserver ddp (SimpleDdpClientObserver.)))
-        
-        ;; connect ddp client
-        (.connect ddp)
-
-        ;; wait for the websocket to connect and handshake
-        (loop [retries 5]
-          (try
-            (Thread/sleep 1000);
-            (catch InterruptedException e))
-          (when (and (pos? retries) (not= ddp-connected (.getState ddp)))
-            (log "Waiting for websocket connection to handshake")
-            (recur (dec retries))))
-
-        (when-not (= ddp-connected (.getState ddp))
-          (throw (ex-info "Websocket connection failed to handshake" {})))
-
-        ;; perform login via random user info, if provided
-        (cond
-          (not-empty users)
-            (let [credentials (first (rand-nth users))]
-              (when debug?
-                (log "logging in with user credentials " credentials)) 
-              (call-method ddp "login" [{"user" {"email" (key credentials)} "password" (val credentials)}]))
-          (not-empty resume-tokens)
-            (let [tokens (clojure.string/split resume-tokens #",")
-                  resume-token (rand-nth tokens)]
-              (when debug?
-                (log "logging in with resume token " resume-token))
-              (call-method ddp "login" [{"resume" resume-token}])))
-
-        ;; initiate subscriptions
-        (perform-subscriptions ddp client-id subscriptions)
-
         ;; return function that will be executed for each test run
         (let [sleep #(sleep-fn call-delay-ms)]
-          (test-runner-factory sleep client-id get-run-id (partial call-method ddp) calls-raw))
+          (test-runner-custom target-url-str users resume-tokens calls-raw subscriptions download-payload? debug? sleep ddp client-id get-run-id get-html (partial call-method ddp)))
         
       )  ; let ddp-client, id
     )  ; returned fn
   )  ; let
 )  ; worker-thread
 
+(defn test-runner-custom
+  "Returns an anonymous function which is run by each worker thread."
+  [target-url-str users resume-tokens calls-raw subscriptions download-payload? debug? sleep ddp client-id get-run-id get-html call-method-fn]
+  (fn []
+
+    (when debug?
+      (log "client id: " client-id))
+
+    ;; download initial html payload and all referenced files
+    (when download-payload?
+      (fetch-static-assets get-html target-url-str))
+
+    ;(if debug? (.addObserver ddp (SimpleDdpClientObserver.)))
+    
+    ;; connect ddp client
+    (.connect ddp)
+
+    ;; wait for the websocket to connect and handshake
+    (loop [retries 5]
+      (try
+        (Thread/sleep 1000);
+        (catch InterruptedException e))
+      (when (and (pos? retries) (not= ddp-connected (.getState ddp)))
+        (log "Waiting for websocket connection to handshake")
+        (recur (dec retries))))
+
+    (when-not (= ddp-connected (.getState ddp))
+      (throw (ex-info "Websocket connection failed to handshake" {})))
+
+    ;; perform login via random user info, if provided
+    (cond
+      (not-empty users)
+        (let [credentials (first (rand-nth users))]
+          (when debug?
+            (log "logging in with user credentials " credentials)) 
+          (call-method ddp "login" [{"user" {"email" (key credentials)} "password" (val credentials)}]))
+      (not-empty resume-tokens)
+        (let [tokens (clojure.string/split resume-tokens #",")
+              resume-token (rand-nth tokens)]
+          (when debug?
+            (log "logging in with resume token " resume-token))
+          (call-method ddp "login" [{"resume" resume-token}])))
+
+    ;; initiate subscriptions
+    (perform-subscriptions ddp client-id subscriptions)
+
+    ;; method calls
+    (comment
+      (log "test run: " (str client-id "-" (get-run-id))))
+
+    (if (empty? calls-raw)
+      (log "No DDP calls to perform")
+      (let [run-id (get-run-id)
+            entry-name (str "load-" run-id)
+            keywords (make-keywords client-id run-id)
+            calls (-> calls-raw
+                     (replace-words keywords)
+                     json/read-str)]
+
+        (comment
+          (log "keywords " keywords)
+          (log "run-id " run-id)
+          (log "entry-name " entry-name)
+          (log "calls " calls))
+
+        (perform-calls sleep call-method-fn calls)
+
+        ))  ; non-empty calls
+
+    )  ; returned anonymous fn
+  )  ; test-runner-factory
 
 (defn test-runner-factory
   "Returns an anonymous function which is run by each worker thread."
